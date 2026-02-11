@@ -19,6 +19,7 @@ import json
 
 # CRITICAL: import datetime as MODULE so we can use datetime.datetime,
 # datetime.date, datetime.time, datetime.timedelta without ambiguity.
+# DO NOT use "from datetime import datetime" — it shadows the module!
 import datetime
 import decimal
 from datetime import timezone
@@ -151,7 +152,7 @@ def _safe_val(v):
         pass
 
     # ---- Temporal types  (must be before generic str check) ----
-    # Use normalize_timestamp for consistent formatting
+    # Use normalize_timestamp for consistent formatting across all datetime types
     if isinstance(v, pd.Timestamp):
         return normalize_timestamp(v)
     if isinstance(v, datetime.datetime):       # before date (subclass)
@@ -199,21 +200,15 @@ def sanitize_df_for_json(df):
     for col in df.select_dtypes(include=['datetime64']).columns:
         # Check for timezone-aware columns (using our backward-compatible function)
         if _is_datetimetz(df[col]):
-            # Convert to UTC if timezone-aware
-            df[col] = df[col].dt.tz_convert('UTC')
+            df[col] = df[col].apply(
+                lambda x: normalize_timestamp(x) if pd.notna(x) else '')
+        else:
+            df[col] = df[col].apply(
+                lambda x: normalize_timestamp(x) if pd.notna(x) else '')
 
-        # Format with milliseconds if they exist
-        df[col] = df[col].apply(normalize_timestamp)
-        df[col] = df[col].where(df[col].notna(), '')
-
-    # Handle other columns
+    # Process all remaining columns
     for col in df.columns:
-        # Skip datetime columns we already handled
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            continue
-
         df[col] = df[col].map(_safe_val)
-
     return df
 
 
@@ -222,12 +217,19 @@ def safe_jsonify(data, status=200):
 
     Uses json.dumps with default=str as ultimate fallback so it
     NEVER raises a serialisation error.
+    Pre-converts datetime objects before serialization.
     """
-    # Convert datetime objects to strings before JSON serialization
-    if isinstance(data, dict):
-        data = {k: _safe_val(v) for k, v in data.items()}
-    elif isinstance(data, (list, tuple)):
-        data = [_safe_val(v) for v in data]
+    def _pre_convert(obj):
+        """Recursively convert datetime objects in dicts/lists."""
+        if isinstance(obj, dict):
+            return {k: _pre_convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_pre_convert(i) for i in obj]
+        if isinstance(obj, (pd.Timestamp, datetime.datetime, datetime.date,
+                            datetime.time, datetime.timedelta)):
+            return normalize_timestamp(obj)
+        return obj
 
+    data = _pre_convert(data)
     payload = json.dumps(data, ensure_ascii=False, default=str)
     return Response(payload, status=status, mimetype='application/json')

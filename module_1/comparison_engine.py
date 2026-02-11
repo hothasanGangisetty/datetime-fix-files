@@ -2,7 +2,7 @@
 Module 1: Smart Fingerprint Comparison Engine
 Key-based + hash-based order-independent comparison for SQL-to-File reconciliation.
 
-Handles all SQL Server temporal types:
+Handles all SQL temporal types:
   TIME (with/without ms), DATETIME, DATETIME2, SMALLDATETIME,
   DATETIMEOFFSET, TIMESTAMP WITH TIME ZONE / LOCAL TIME ZONE
 """
@@ -10,19 +10,18 @@ Handles all SQL Server temporal types:
 import pandas as pd
 import numpy as np
 import re
-import time as time_module  # renamed to avoid clash with datetime.time
+# CRITICAL: "import time" would clash with datetime.time references.
+# Rename to time_module so time_module.time() works for perf timing.
+import time as time_module
 from collections import Counter
 
-# CRITICAL: import datetime as MODULE to avoid the
-# "type object 'datetime' has no attribute 'time'" error.
-# When you do `from datetime import datetime`, the name `datetime`
-# becomes the CLASS, and `datetime.time` fails because the class
-# doesn't have a `.time` type attribute.
+# CRITICAL: import datetime as MODULE alias so we can use
+# dt_module.datetime, dt_module.date, dt_module.time, dt_module.timedelta
+# DO NOT use "from datetime import datetime" — it shadows the module!
 import datetime as dt_module
-from datetime import timezone
 
-# Import from our json_utils (which also uses `import datetime` as module)
-from common.json_utils import sanitize_df_for_json, _is_datetimetz, normalize_timestamp
+from common.json_utils import (sanitize_df_for_json, _is_datetimetz,
+                                normalize_timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +52,7 @@ def normalize_series_for_comparison(s):
         if pd.isna(val) or val is None:
             return '__NULL__'
 
-        # Handle all datetime types first
+        # Handle all datetime types first via normalize_timestamp
         if isinstance(val, (pd.Timestamp, dt_module.datetime, dt_module.date,
                             dt_module.time, dt_module.timedelta)):
             ts_str = normalize_timestamp(val)
@@ -82,6 +81,8 @@ def normalize_series_for_comparison(s):
         # Matches: 2024-12-01 10:20:30.123000 -> 2024-12-01 10:20:30.123
         # Also matches: 10:20:30.123000 -> 10:20:30.123
         s_val = re.sub(r'(\.\d*?)0+$', r'\1', s_val)
+        # Clean up lone decimal point: "10:20:30." -> "10:20:30"
+        s_val = re.sub(r'\.$', '', s_val)
 
         # Numeric normalisation: 1750.0 -> 1750, 1750.50 -> 1750.5
         try:
@@ -103,35 +104,46 @@ def _fast_normalize_series(s):
     Produces the *same* logical result as normalize_series_for_comparison()
     but uses bulk pandas string operations instead of per-cell Python calls.
     ~10-30x faster on 1M rows.
-
-    Handles datetime columns (including timezone-aware) specially.
     """
-    # Handle datetime columns
+    # ---- Handle datetime64 columns natively ----
     if pd.api.types.is_datetime64_any_dtype(s):
-        # Format with milliseconds if they exist
         if _is_datetimetz(s):
-            # Convert to UTC first
-            s_utc = s.dt.tz_convert('UTC')
-            formatted = s_utc.dt.strftime('%Y-%m-%d %H:%M:%S.%f').str[:-3]
-            formatted = formatted.where(
-                s_utc.dt.microsecond > 0,
-                s_utc.dt.strftime('%Y-%m-%d %H:%M:%S')
-            ) + 'Z'
-            return formatted.where(~formatted.isna(), '__NULL__')
+            out = s.dt.tz_convert('UTC').apply(
+                lambda x: normalize_timestamp(x) if pd.notna(x) else '__NULL__')
         else:
-            formatted = s.dt.strftime('%Y-%m-%d %H:%M:%S.%f').str[:-3]
-            formatted = formatted.where(
-                s.dt.microsecond > 0,
-                s.dt.strftime('%Y-%m-%d %H:%M:%S')
-            )
-            return formatted.where(~formatted.isna(), '__NULL__')
+            out = s.apply(
+                lambda x: normalize_timestamp(x) if pd.notna(x) else '__NULL__')
+        return out
 
-    # Handle timedelta columns
+    # ---- Handle timedelta columns ----
     if pd.api.types.is_timedelta64_dtype(s):
-        return s.apply(
-            lambda x: normalize_timestamp(x) if pd.notna(x) else '__NULL__'
-        )
+        out = s.apply(
+            lambda x: normalize_timestamp(x) if pd.notna(x) else '__NULL__')
+        return out
 
+    # ---- Handle object columns that may contain datetime objects ----
+    sample = s.dropna().head(20)
+    has_dt_objects = any(isinstance(v, (pd.Timestamp, dt_module.datetime,
+                                        dt_module.date, dt_module.time,
+                                        dt_module.timedelta))
+                        for v in sample)
+    if has_dt_objects:
+        def _norm_cell(val):
+            if pd.isna(val) or val is None:
+                return '__NULL__'
+            if isinstance(val, (pd.Timestamp, dt_module.datetime, dt_module.date,
+                                dt_module.time, dt_module.timedelta)):
+                ts_str = normalize_timestamp(val)
+                ts_str = re.sub(r'(\.\d*?)0+$', r'\1', ts_str)
+                ts_str = re.sub(r'\.$', '', ts_str)
+                return ts_str
+            s_val = str(val).strip()
+            if s_val in ('', 'None', 'nan', 'NaT', 'NaN', '<NA>'):
+                return '__NULL__'
+            return s_val
+        return s.map(_norm_cell)
+
+    # ---- Standard string-based normalisation ----
     # Convert everything to string, strip whitespace
     out = s.astype(str).str.strip()
 
@@ -139,29 +151,13 @@ def _fast_normalize_series(s):
     null_mask = out.isin(['', 'None', 'nan', 'NaT', 'NaN', '<NA>'])
     out = out.where(~null_mask, '__NULL__')
 
-    # Handle different datetime formats
-    # Date-only
-    date_mask = out.str.match(r'^\d{4}-\d{2}-\d{2}$')
-    # Time-only
-    time_mask = out.str.match(r'^\d{2}:\d{2}:\d{2}(\.\d{1,6})?$')
-    # Datetime with milliseconds
-    datetime_ms_mask = out.str.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{1,6}$')
-    # Datetime without milliseconds
-    datetime_no_ms_mask = out.str.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
-
-    # Add .000 to datetime without milliseconds
-    out = out.where(~datetime_no_ms_mask, out + '.000')
-
-    # Handle timezone information
-    tz_mask = out.str.contains(r'[Z|[+\-]\d{2}:\d{2}$')
-    out = out.where(~tz_mask, out + 'Z')
-
     # Strip midnight time component: "2025-01-01 00:00:00" -> "2025-01-01"
     out = out.str.replace(r'\s+00:00:00(\.\d+)?$', '', regex=True)
 
-    # Strip trailing zero seconds for SMALLDATETIME (datetime strings only)
-    # Only match when preceded by a date: YYYY-MM-DD HH:MM:00
-    out = out.str.replace(r'(\\d{4}-\\d{2}-\\d{2}\\s+\\d{1,2}:\\d{2}):00(\\.\\d*)?$', r'\\1', regex=True)
+    # Strip trailing zero seconds only for DATETIME strings (with date prefix)
+    # Do NOT strip from standalone time values like "14:30:00"
+    out = out.str.replace(
+        r'(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}):00(\.\d*)?$', r'\1', regex=True)
 
     # Numeric normalisation via string regex (avoids slow pd.to_numeric):
     # "1750.0" / "1750.00" -> "1750"
@@ -175,15 +171,11 @@ def _fast_normalize_series(s):
 
 
 def _clean_display_value(val):
-    """Clean a value for display -- strip midnight timestamps, tidy numbers.
-
-    Properly handles: datetime.time, datetime.datetime, datetime.date,
-    datetime.timedelta, pd.Timestamp, and string representations.
-    """
-    if pd.isna(val) or val is None:
+    """Clean a value for display -- handles all datetime types, strip midnight, tidy numbers."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
         return ''
 
-    # Handle all datetime types directly via normalize_timestamp
+    # Handle all datetime types via normalize_timestamp
     if isinstance(val, (pd.Timestamp, dt_module.datetime, dt_module.date,
                         dt_module.time, dt_module.timedelta)):
         return normalize_timestamp(val)
@@ -192,32 +184,19 @@ def _clean_display_value(val):
     if s in ('None', 'nan', 'NaT', 'NaN', ''):
         return ''
 
-    # Handle string representations
-    # Date-only
-    if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
-        return s
+    # Try to detect datetime strings and format them
+    if re.match(r'\d{4}-\d{2}-\d{2}', s):
+        try:
+            ts = pd.to_datetime(s)
+            return normalize_timestamp(ts)
+        except Exception:
+            pass
 
-    # Time-only
-    if re.match(r'^\d{2}:\d{2}:\d{2}(\.\d{1,6})?$', s):
-        return s
+    # 1. Strip midnight time component: "2025-01-01 00:00:00" -> "2025-01-01"
+    s = re.sub(r'\s+00:00:00(\.\d+)?$', '', s)
 
-    # Datetime with milliseconds
-    if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{1,6}$', s):
-        return s
-
-    # Datetime without milliseconds
-    if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$', s):
-        return s
-
-    # Handle other string formats
-    try:
-        # Try parsing with pandas to_datetime
-        dt = pd.to_datetime(s)
-        if pd.isna(dt):
-            return ''
-        return normalize_timestamp(dt)
-    except (ValueError, TypeError):
-        pass
+    # 2. Strip trailing zero seconds for DATETIME strings only
+    s = re.sub(r'(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}):00(\.\d*)?$', r'\1', s)
 
     return s
 
@@ -285,13 +264,12 @@ def transform_to_pre_post(diff_df, key_cols, common_cols, sql_label='SQL', file_
 def _compute_normalized_frame(df, cols):
     """Return a DataFrame of normalised string values for *cols*.
     Uses the fast vectorised path for performance on large datasets.
-    Special handling for datetime columns (including timezone-aware)."""
+    Handles datetime and tz-aware columns."""
     nf = pd.DataFrame(index=df.index)
     for col in cols:
-        # Special handling for datetime columns
-        if (pd.api.types.is_datetime64_any_dtype(df[col]) or
-                _is_datetimetz(df[col])):
-            nf[col] = df[col].apply(normalize_timestamp)
+        # Detect datetime/tz-aware columns for special handling
+        if pd.api.types.is_datetime64_any_dtype(df[col]) or _is_datetimetz(df[col]):
+            nf[col] = _fast_normalize_series(df[col])
         else:
             nf[col] = _fast_normalize_series(df[col])
     return nf
@@ -323,7 +301,8 @@ def _smart_no_key_comparison(df_sql, df_file, common_cols):
     sql_hashes  = pd.util.hash_pandas_object(sql_norm, index=False)
     file_hashes = pd.util.hash_pandas_object(file_norm, index=False)
 
-    print(f"  [Fingerprint] Hashed {len(df_sql)} SQL + {len(df_file)} File rows in {time_module.time()-t0:.2f}s")
+    print(f"  [Fingerprint] Hashed {len(df_sql)} SQL + {len(df_file)} File rows "
+          f"in {time_module.time()-t0:.2f}s")
 
     # ---- Step 2: multiset exact-match elimination ----
     t1 = time_module.time()
@@ -396,7 +375,8 @@ def _smart_no_key_comparison(df_sql, df_file, common_cols):
                     file_paired_set.add(j)
 
             print(f"  [Pair]   {len(paired)} similarity pairs found "
-                  f"(threshold {min_threshold}/{n_cols} cols) in {time_module.time()-t2:.2f}s")
+                  f"(threshold {min_threshold}/{n_cols} cols) "
+                  f"in {time_module.time()-t2:.2f}s")
 
             # Remove paired indices from the unmatched lists
             paired_sql  = {p[0] for p in paired}
@@ -510,22 +490,41 @@ def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
 
     file_name is used as the label for the file source column (instead of 'post').
 
-    Handles all SQL temporal types:
-      TIME, DATETIME, DATETIME2, SMALLDATETIME, DATETIMEOFFSET,
-      TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH LOCAL TIME ZONE
+    Automatically normalizes all datetime/timezone columns at entry so that
+    SQL temporal types (TIME, DATETIME2, DATETIMEOFFSET, etc.) compare correctly
+    with their string representations from files.
     """
     t_start = time_module.time()
 
-    # ── Convert all datetime columns to normalized strings at entry ──
-    # This prevents downstream type confusion (datetime.time vs time module, etc.)
-    for col in df_sql.columns:
-        if (pd.api.types.is_datetime64_any_dtype(df_sql[col]) or
-                _is_datetimetz(df_sql[col])):
-            df_sql[col] = df_sql[col].apply(normalize_timestamp)
-    for col in df_file.columns:
-        if (pd.api.types.is_datetime64_any_dtype(df_file[col]) or
-                _is_datetimetz(df_file[col])):
-            df_file[col] = df_file[col].apply(normalize_timestamp)
+    # ═══════════════════════════════════════════════════════════════════════
+    # Pre-normalize datetime columns to strings at entry
+    # This ensures SQL datetime objects compare correctly with file strings
+    # ═══════════════════════════════════════════════════════════════════════
+    for df in (df_sql, df_file):
+        for col in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                if _is_datetimetz(df[col]):
+                    df[col] = df[col].dt.tz_convert('UTC').apply(
+                        lambda x: normalize_timestamp(x) if pd.notna(x) else None)
+                else:
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if pd.notna(x) else None)
+            elif pd.api.types.is_timedelta64_dtype(df[col]):
+                df[col] = df[col].apply(
+                    lambda x: normalize_timestamp(x) if pd.notna(x) else None)
+            elif df[col].dtype == object:
+                # Check for datetime.time or datetime.timedelta objects
+                sample = df[col].dropna().head(10)
+                has_dt = any(isinstance(v, (dt_module.time, dt_module.timedelta,
+                                            dt_module.datetime, dt_module.date))
+                             for v in sample)
+                if has_dt:
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x)
+                        if isinstance(x, (pd.Timestamp, dt_module.datetime,
+                                          dt_module.date, dt_module.time,
+                                          dt_module.timedelta))
+                        else x)
 
     if keys and len(keys) > 0:
         # ---- Key-Based ----
@@ -547,14 +546,18 @@ def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
             "elapsed_seconds":    round(time_module.time() - t_start, 2)
         }
 
-        pre_post_df = transform_to_pre_post(final, key_cols, common_cols, sql_label='SQL', file_label=file_name)
+        pre_post_df = transform_to_pre_post(
+            final, key_cols, common_cols, sql_label='SQL', file_label=file_name)
 
-        # Apply sanitization to datetime columns in pre_post_df
+        # Post-comparison: ensure all datetime columns are sanitized
         for col in pre_post_df.columns:
-            if col in common_cols:
-                if (pd.api.types.is_datetime64_any_dtype(df_sql[col]) if col in df_sql.columns else False) or \
-                   (pd.api.types.is_datetime64_any_dtype(df_file[col]) if col in df_file.columns else False):
-                    pre_post_df[col] = pre_post_df[col].apply(_clean_display_value)
+            if pre_post_df[col].dtype == object:
+                pre_post_df[col] = pre_post_df[col].apply(
+                    lambda x: normalize_timestamp(x)
+                    if isinstance(x, (pd.Timestamp, dt_module.datetime,
+                                      dt_module.date, dt_module.time,
+                                      dt_module.timedelta))
+                    else x)
 
         return pre_post_df, summary
 
@@ -583,13 +586,6 @@ def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
             "elapsed_seconds":    round(time_module.time() - t_start, 2)
         }
 
-        pre_post_df = transform_to_pre_post(diff_df, key_cols, common_cols, sql_label='SQL', file_label=file_name)
-
-        # Apply sanitization to datetime columns in pre_post_df
-        for col in pre_post_df.columns:
-            if col in common_cols:
-                if (pd.api.types.is_datetime64_any_dtype(df_sql[col]) or
-                        pd.api.types.is_datetime64_any_dtype(df_file[col])):
-                    pre_post_df[col] = pre_post_df[col].apply(_clean_display_value)
-
+        pre_post_df = transform_to_pre_post(
+            diff_df, key_cols, common_cols, sql_label='SQL', file_label=file_name)
         return pre_post_df, summary

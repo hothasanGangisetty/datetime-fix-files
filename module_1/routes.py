@@ -1,6 +1,10 @@
 """
 Module 1: SQL-to-File Comparison Routes
 Flask Blueprint — handles SQL query, file upload, comparison, results, export.
+
+Enhanced with proper handling for all SQL temporal types:
+  TIME, DATETIME, DATETIME2, SMALLDATETIME,
+  DATETIMEOFFSET, TIMESTAMP WITH TIME ZONE / LOCAL TIME ZONE
 """
 
 from flask import Blueprint, request, send_file
@@ -8,6 +12,10 @@ import pyodbc
 import pandas as pd
 import numpy as np
 import uuid
+import traceback
+
+# CRITICAL: import datetime as MODULE alias so dt_module.datetime,
+# dt_module.time, dt_module.timedelta all work without ambiguity.
 import datetime as dt_module
 from datetime import timezone
 import re
@@ -52,35 +60,35 @@ def handle_sql_datetime_types(df):
                 )
 
         # Detect date-only columns
-        elif pd.api.types.is_datetime64_any_dtype(df[col]) and not _is_datetimetz(df[col]):
-            # For datetime64 columns that aren't timezone-aware, assume they're date-only
-            df[col] = df[col].dt.strftime('%Y-%m-%d')
+        elif df[col].dtype == object:
+            sample = df[col].dropna().head(10)
+            if len(sample) > 0:
+                # Check for datetime.date objects
+                if all(isinstance(v, dt_module.date) and not isinstance(v, dt_module.datetime) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.date) else x
+                    )
+                # Check for datetime.time objects (SQL TIME type)
+                elif any(isinstance(v, dt_module.time) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.time) else x
+                    )
+                # Check for datetime.timedelta objects
+                elif any(isinstance(v, dt_module.timedelta) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.timedelta) else x
+                    )
+                # Check for datetime.datetime objects
+                elif any(isinstance(v, dt_module.datetime) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.datetime) else x
+                    )
 
-        # Detect time-only columns
+        # Detect timedelta columns
         elif pd.api.types.is_timedelta64_dtype(df[col]):
-            # For timedelta columns, format as HH:MM:SS
             df[col] = df[col].apply(
                 lambda x: normalize_timestamp(x) if pd.notna(x) else ''
             )
-
-        # Detect string columns that might contain datetime info
-        elif df[col].dtype == 'object':
-            # Try to parse as datetime where possible
-            try:
-                # First try to parse with timezone handling
-                parsed = pd.to_datetime(df[col], errors='ignore', utc=True)
-                if pd.api.types.is_datetime64_any_dtype(parsed):
-                    if _is_datetimetz(parsed):
-                        df[col] = parsed.dt.tz_convert('UTC').apply(
-                            lambda x: normalize_timestamp(x) if pd.notna(x) else ''
-                        )
-                    else:
-                        df[col] = parsed.apply(
-                            lambda x: normalize_timestamp(x) if pd.notna(x) else ''
-                        )
-            except Exception:
-                # If parsing fails, leave the column as is
-                pass
 
     return df
 
@@ -111,7 +119,7 @@ def preview_sql():
         conn = pyodbc.connect(conn_str, timeout=10)
         df = pd.read_sql(query, conn)
 
-        # Handle all datetime types consistently
+        # Handle SQL datetime types before JSON serialization
         df = handle_sql_datetime_types(df)
 
         preview_df = df.head(5)
@@ -133,6 +141,7 @@ def preview_sql():
         })
 
     except Exception as e:
+        traceback.print_exc()
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
 
@@ -160,11 +169,11 @@ def upload_file():
         else:
             return safe_jsonify({"error": "Invalid file format. Only CSV or Excel allowed."}, 400)
 
-        # Handle all datetime types consistently
-        df = handle_sql_datetime_types(df)
-
         # Save to Disk Cache FIRST (Parquet handles NaN natively)
         save_df(df, 'uploads', unique_id)
+
+        # Handle SQL datetime types before JSON serialization
+        df = handle_sql_datetime_types(df)
 
         # Build preview (sanitize handles NaN/NaT → '' for JSON safety)
         preview_df = df.head(5)
@@ -180,6 +189,7 @@ def upload_file():
         })
 
     except Exception as e:
+        traceback.print_exc()
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
 
@@ -216,10 +226,6 @@ def run_comparison():
         conn_str = get_connection_string(server, database, port)
         conn = pyodbc.connect(conn_str)
         df_sql = pd.read_sql(query, conn)
-
-        # Handle all datetime types consistently
-        df_sql = handle_sql_datetime_types(df_sql)
-
         conn.close()
 
         # 3. Apply Column Mapping
@@ -232,22 +238,24 @@ def run_comparison():
             df_file = df_file[[c for c in mapped_file_cols if c in df_file.columns]]
             df_file = df_file.rename(columns=rename_map)
 
-        # 4. Run Logic
+        # 4. Run Logic (comparison engine handles datetime normalization internally)
         result_df, summary = run_hybrid_comparison(df_sql, df_file, keys, file_name=file_name)
 
-        # Convert all datetime columns to normalized strings
+        # 5. Post-comparison: normalize any remaining datetime columns in result
         for col in result_df.columns:
-            if (pd.api.types.is_datetime64_any_dtype(result_df[col]) or
-                    (hasattr(result_df[col], 'dt') and result_df[col].dt.tz is not None)):
+            if result_df[col].dtype == object:
                 result_df[col] = result_df[col].apply(
-                    lambda x: normalize_timestamp(x) if pd.notna(x) else ''
-                )
+                    lambda x: normalize_timestamp(x)
+                    if isinstance(x, (pd.Timestamp, dt_module.datetime,
+                                      dt_module.date, dt_module.time,
+                                      dt_module.timedelta))
+                    else x)
 
-        # 5. Cache Result
+        # 6. Cache Result
         result_id = str(uuid.uuid4())
         save_df(result_df, 'results', result_id)
 
-        # 6. Return Summary + First Page
+        # 7. Return Summary + First Page
         preview_page = sanitize_df_for_json(result_df.head(50)).to_dict(orient='records')
 
         return safe_jsonify({
@@ -259,8 +267,6 @@ def run_comparison():
         })
 
     except Exception as e:
-        # Log the full error for debugging
-        import traceback
         traceback.print_exc()
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
@@ -279,7 +285,7 @@ def get_results_page():
     if df is None:
         return safe_jsonify({"error": "Result cache expired. Run comparison again."}, 404)
 
-    # Handle all datetime types consistently
+    # Handle any datetime types that survived caching
     df = handle_sql_datetime_types(df)
 
     # Calculate slice
@@ -316,14 +322,15 @@ def export_excel():
     if df is None:
         return safe_jsonify({"error": "Result cache expired. Run comparison again."}, 404)
 
-    # Handle all datetime types consistently
+    # Handle SQL datetime types before Excel export
     df = handle_sql_datetime_types(df)
-
-    # Convert all values to strings for Excel export
-    df = df.applymap(lambda x: str(x) if not pd.isna(x) else '')
 
     # Sanitize all cells for display (handles NaT, time objects, etc.)
     df = sanitize_df_for_json(df)
+
+    # Convert all remaining objects to strings for Excel safety
+    for col in df.columns:
+        df[col] = df[col].apply(lambda x: str(x) if not pd.isna(x) else '')
 
     # ── Color definitions (match web UI) ──
     header_fill = PatternFill(start_color='334155', end_color='334155', fill_type='solid')
