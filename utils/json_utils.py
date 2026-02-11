@@ -19,7 +19,8 @@ import json
 
 # CRITICAL: import datetime as MODULE so we can use datetime.datetime,
 # datetime.date, datetime.time, datetime.timedelta without ambiguity.
-# DO NOT use "from datetime import datetime" — it shadows the module!
+# DO NOT use "from datetime import datetime" — it shadows the module
+# and causes: "type object 'datetime.datetime' has no attribute 'time'"
 import datetime
 import decimal
 from datetime import timezone
@@ -85,7 +86,6 @@ def normalize_timestamp(val):
 
     # ---- Handle datetime.time objects (TIME with/without ms) ----
     if isinstance(val, datetime.time):
-        # Create a full datetime object so strftime works properly
         dt = datetime.datetime.combine(datetime.date.min, val)
         if val.tzinfo is not None:
             dt_utc = dt.astimezone(timezone.utc)
@@ -198,7 +198,6 @@ def sanitize_df_for_json(df):
 
     # Handle datetime columns first for better performance
     for col in df.select_dtypes(include=['datetime64']).columns:
-        # Check for timezone-aware columns (using our backward-compatible function)
         if _is_datetimetz(df[col]):
             df[col] = df[col].apply(
                 lambda x: normalize_timestamp(x) if pd.notna(x) else '')

@@ -1,33 +1,75 @@
 """
-Module 1: SQL-to-File Comparison Routes
-Flask Blueprint — handles SQL query, file upload, comparison, results, export.
+SQL File Reconcile Tool — Main Flask Application
+=================================================
+Monolithic entry point: all API routes + React UI serving.
 
-Enhanced with proper handling for all SQL temporal types:
+Frontend: Vite-built React app in frontend/dist/
+Backend:  Flask + pyodbc + pandas
+
+Handles all SQL Server temporal types:
   TIME, DATETIME, DATETIME2, SMALLDATETIME,
   DATETIMEOFFSET, TIMESTAMP WITH TIME ZONE / LOCAL TIME ZONE
 """
 
-from flask import Blueprint, request, send_file
-import pyodbc
-import pandas as pd
-import numpy as np
+from flask import Flask, request, send_from_directory, send_file
+from flask_cors import CORS
+import os
+import json
+import atexit
 import uuid
 import traceback
 
+import pyodbc
+import pandas as pd
+import numpy as np
+
 # CRITICAL: import datetime as MODULE alias so dt_module.datetime,
 # dt_module.time, dt_module.timedelta all work without ambiguity.
+# DO NOT use "from datetime import datetime" — it shadows the module!
 import datetime as dt_module
 from datetime import timezone
-import re
 
-from common.json_utils import (safe_jsonify, sanitize_df_for_json,
-                                _is_datetimetz, normalize_timestamp)
-from common.db_utils import get_connection_string
-from common.storage_manager import save_df, load_df
-from common.routes import _touch_activity
-from module_1.comparison_engine import run_hybrid_comparison
+from utils.json_utils import (safe_jsonify, sanitize_df_for_json,
+                               _is_datetimetz, normalize_timestamp)
+from comparison_engine import run_hybrid_comparison
+from storage_manager import save_df, load_df, clear_cache, init_cache
 
-m1_bp = Blueprint('module_1', __name__)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# App Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), 'frontend', 'dist')
+DB_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'db_config.json')
+
+app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path='')
+CORS(app)
+
+# Initialize cache directories
+init_cache()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Database Connection Helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_connection_string(server, database, port=None):
+    """Build ODBC connection string from parameters."""
+    # Try to read driver from db_config.json, fallback to ODBC Driver 17
+    driver = 'ODBC Driver 17 for SQL Server'
+    try:
+        if os.path.exists(DB_CONFIG_PATH):
+            with open(DB_CONFIG_PATH, 'r') as f:
+                cfg = json.load(f)
+                driver = cfg.get('driver', driver)
+    except Exception:
+        pass
+
+    conn_str = f"DRIVER={{{driver}}};SERVER={server}"
+    if port:
+        conn_str += f",{port}"
+    conn_str += f";DATABASE={database};Trusted_Connection=yes;TrustServerCertificate=yes;"
+    return conn_str
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -47,42 +89,14 @@ def handle_sql_datetime_types(df):
     for col in df.columns:
         # Detect datetime columns
         if pd.api.types.is_datetime64_any_dtype(df[col]):
-            # Check for timezone-aware columns
             if _is_datetimetz(df[col]):
-                # Convert to UTC first, then format
                 df[col] = df[col].dt.tz_convert('UTC').apply(
                     lambda x: normalize_timestamp(x) if pd.notna(x) else ''
                 )
             else:
-                # Format with milliseconds if they exist
                 df[col] = df[col].apply(
                     lambda x: normalize_timestamp(x) if pd.notna(x) else ''
                 )
-
-        # Detect date-only columns
-        elif df[col].dtype == object:
-            sample = df[col].dropna().head(10)
-            if len(sample) > 0:
-                # Check for datetime.date objects
-                if all(isinstance(v, dt_module.date) and not isinstance(v, dt_module.datetime) for v in sample):
-                    df[col] = df[col].apply(
-                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.date) else x
-                    )
-                # Check for datetime.time objects (SQL TIME type)
-                elif any(isinstance(v, dt_module.time) for v in sample):
-                    df[col] = df[col].apply(
-                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.time) else x
-                    )
-                # Check for datetime.timedelta objects
-                elif any(isinstance(v, dt_module.timedelta) for v in sample):
-                    df[col] = df[col].apply(
-                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.timedelta) else x
-                    )
-                # Check for datetime.datetime objects
-                elif any(isinstance(v, dt_module.datetime) for v in sample):
-                    df[col] = df[col].apply(
-                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.datetime) else x
-                    )
 
         # Detect timedelta columns
         elif pd.api.types.is_timedelta64_dtype(df[col]):
@@ -90,15 +104,54 @@ def handle_sql_datetime_types(df):
                 lambda x: normalize_timestamp(x) if pd.notna(x) else ''
             )
 
+        # Detect object columns with datetime/time/timedelta objects
+        elif df[col].dtype == object:
+            sample = df[col].dropna().head(10)
+            if len(sample) > 0:
+                if all(isinstance(v, dt_module.date) and not isinstance(v, dt_module.datetime) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.date) else x)
+                elif any(isinstance(v, dt_module.time) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.time) else x)
+                elif any(isinstance(v, dt_module.timedelta) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.timedelta) else x)
+                elif any(isinstance(v, dt_module.datetime) for v in sample):
+                    df[col] = df[col].apply(
+                        lambda x: normalize_timestamp(x) if isinstance(x, dt_module.datetime) else x)
+
     return df
 
 
-@m1_bp.route('/api/preview_sql', methods=['POST'])
+# ═══════════════════════════════════════════════════════════════════════════
+# API Routes
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/test_connection', methods=['POST'])
+def test_connection():
+    """Test SQL Server connection."""
+    data = request.json
+    server = data.get('server')
+    database = data.get('database')
+    port = data.get('port')
+
+    if not server or not database:
+        return safe_jsonify({"error": "Missing server or database"}, 400)
+
+    conn_str = get_connection_string(server, database, port)
+
+    try:
+        conn = pyodbc.connect(conn_str, timeout=10)
+        conn.close()
+        return safe_jsonify({"status": "success", "message": "Connection successful!"})
+    except Exception as e:
+        return safe_jsonify({"status": "error", "message": str(e)}, 500)
+
+
+@app.route('/api/preview_sql', methods=['POST'])
 def preview_sql():
-    """
-    Executes a SQL query and returns columns + top 5 rows.
-    """
-    _touch_activity()
+    """Executes a SQL query and returns columns + top 5 rows."""
     data = request.json
     server = data.get('server')
     database = data.get('database')
@@ -109,9 +162,12 @@ def preview_sql():
         return safe_jsonify({"error": "Missing parameters"}, 400)
 
     # Basic Safety Check (Prevent modifications)
-    forbidden_keywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'TRUNCATE', 'ALTER', 'GRANT', 'REVOKE', 'EXEC', 'CREATE', 'MERGE']
+    forbidden_keywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'TRUNCATE',
+                          'ALTER', 'GRANT', 'REVOKE', 'EXEC', 'CREATE', 'MERGE']
     if any(keyword in query.upper() for keyword in forbidden_keywords):
-        return safe_jsonify({"error": "Security Alert: Only SELECT queries are permitted in this environment."}, 403)
+        return safe_jsonify({
+            "error": "Security Alert: Only SELECT queries are permitted in this environment."
+        }, 403)
 
     conn_str = get_connection_string(server, database, port)
 
@@ -126,7 +182,6 @@ def preview_sql():
         columns = list(preview_df.columns)
         rows = sanitize_df_for_json(preview_df).to_dict(orient='records')
 
-        # Include last row for truncated preview display in console
         last_row = None
         if len(df) > 5:
             last_row = sanitize_df_for_json(df.tail(1)).to_dict(orient='records')[0]
@@ -145,12 +200,9 @@ def preview_sql():
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
 
-@m1_bp.route('/api/upload_file', methods=['POST'])
+@app.route('/api/upload_file', methods=['POST'])
 def upload_file():
-    """
-    Uploads a file, saves it temp, and returns columns + preview.
-    """
-    _touch_activity()
+    """Uploads a file, saves it temp, and returns columns + preview."""
     if 'file' not in request.files:
         return safe_jsonify({"error": "No file part"}, 400)
 
@@ -167,7 +219,9 @@ def upload_file():
         elif filename.endswith(('.xls', '.xlsx')):
             df = pd.read_excel(file)
         else:
-            return safe_jsonify({"error": "Invalid file format. Only CSV or Excel allowed."}, 400)
+            return safe_jsonify({
+                "error": "Invalid file format. Only CSV or Excel allowed."
+            }, 400)
 
         # Save to Disk Cache FIRST (Parquet handles NaN natively)
         save_df(df, 'uploads', unique_id)
@@ -175,7 +229,7 @@ def upload_file():
         # Handle SQL datetime types before JSON serialization
         df = handle_sql_datetime_types(df)
 
-        # Build preview (sanitize handles NaN/NaT → '' for JSON safety)
+        # Build preview
         preview_df = df.head(5)
         columns = list(preview_df.columns)
         rows = sanitize_df_for_json(preview_df).to_dict(orient='records')
@@ -193,7 +247,7 @@ def upload_file():
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
 
-@m1_bp.route('/api/run_comparison', methods=['POST'])
+@app.route('/api/run_comparison', methods=['POST'])
 def run_comparison():
     """
     Orchestrates the Comparison:
@@ -202,7 +256,6 @@ def run_comparison():
     3. Runs Hybrid Comparison Engine.
     4. Caches Result.
     """
-    _touch_activity()
     data = request.json
     file_id = data.get('file_id')
     server = data.get('server')
@@ -211,7 +264,6 @@ def run_comparison():
     port = data.get('port')
     keys = data.get('keys', [])
     column_mapping = data.get('column_mapping', [])
-    file_name = data.get('file_name', 'File')
 
     if not file_id or not server or not database or not query:
         return safe_jsonify({"error": "Missing required parameters"}, 400)
@@ -219,7 +271,9 @@ def run_comparison():
     # 1. Retrieve File Data
     df_file = load_df('uploads', file_id)
     if df_file is None:
-        return safe_jsonify({"error": "File session expired or invalid. Please re-upload."}, 404)
+        return safe_jsonify({
+            "error": "File session expired or invalid. Please re-upload."
+        }, 404)
 
     try:
         # 2. Fetch Full SQL Data
@@ -239,7 +293,7 @@ def run_comparison():
             df_file = df_file.rename(columns=rename_map)
 
         # 4. Run Logic (comparison engine handles datetime normalization internally)
-        result_df, summary = run_hybrid_comparison(df_sql, df_file, keys, file_name=file_name)
+        result_df, summary = run_hybrid_comparison(df_sql, df_file, keys)
 
         # 5. Post-comparison: normalize any remaining datetime columns in result
         for col in result_df.columns:
@@ -271,24 +325,22 @@ def run_comparison():
         return safe_jsonify({"status": "error", "message": str(e)}, 500)
 
 
-@m1_bp.route('/api/results_page', methods=['GET'])
+@app.route('/api/results_page', methods=['GET'])
 def get_results_page():
-    """
-    Pagination for the Data Grid.
-    Query Params: result_id, page (1-based), size (default 100)
-    """
+    """Pagination for the Data Grid."""
     result_id = request.args.get('result_id')
     page = int(request.args.get('page', 1))
     size = int(request.args.get('size', 100))
 
     df = load_df('results', result_id)
     if df is None:
-        return safe_jsonify({"error": "Result cache expired. Run comparison again."}, 404)
+        return safe_jsonify({
+            "error": "Result cache expired. Run comparison again."
+        }, 404)
 
     # Handle any datetime types that survived caching
     df = handle_sql_datetime_types(df)
 
-    # Calculate slice
     start = (page - 1) * size
     end = start + size
 
@@ -306,7 +358,7 @@ def get_results_page():
     })
 
 
-@m1_bp.route('/api/export_excel', methods=['GET'])
+@app.route('/api/export_excel', methods=['GET'])
 def export_excel():
     """Generate styled Excel file with color-coded reconciliation results."""
     from openpyxl import Workbook
@@ -320,12 +372,14 @@ def export_excel():
 
     df = load_df('results', result_id)
     if df is None:
-        return safe_jsonify({"error": "Result cache expired. Run comparison again."}, 404)
+        return safe_jsonify({
+            "error": "Result cache expired. Run comparison again."
+        }, 404)
 
     # Handle SQL datetime types before Excel export
     df = handle_sql_datetime_types(df)
 
-    # Sanitize all cells for display (handles NaT, time objects, etc.)
+    # Sanitize all cells for display
     df = sanitize_df_for_json(df)
 
     # Convert all remaining objects to strings for Excel safety
@@ -363,14 +417,13 @@ def export_excel():
 
     def write_section(ws, section_df, title, start_row):
         """Write a section with title, headers, and colored data rows."""
-        # Section title row
-        ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=len(display_cols))
+        ws.merge_cells(start_row=start_row, start_column=1,
+                       end_row=start_row, end_column=len(display_cols))
         cell = ws.cell(row=start_row, column=1, value=title)
         cell.font = section_font
         cell.fill = section_title_fill
         start_row += 1
 
-        # Column headers
         for ci, col_name in enumerate(display_cols, 1):
             cell = ws.cell(row=start_row, column=ci, value=col_name)
             cell.fill = header_fill
@@ -379,14 +432,13 @@ def export_excel():
             cell.alignment = Alignment(horizontal='center')
         start_row += 1
 
-        # Data rows
         for _, row in section_df.iterrows():
             mismatch_cols = [c.strip() for c in str(row.get('_mismatch_cols', '')).split(',') if c.strip()]
             status = str(row.get('status', ''))
-            source_val = str(row.get('source', ''))
+            pre_post_val = str(row.get('pre/post', ''))
 
             if status == 'Mismatch':
-                base_fill = pre_fill if source_val == 'SQL' else post_fill
+                base_fill = pre_fill if pre_post_val == 'pre' else post_fill
             elif status == 'Only in SQL':
                 base_fill = sql_only_fill
             elif status == 'Only in File':
@@ -413,11 +465,14 @@ def export_excel():
     current_row = 1
 
     if len(mismatched) > 0:
-        current_row = write_section(ws, mismatched, f"Mismatched Rows ({len(mismatched) // 2})", current_row)
+        current_row = write_section(ws, mismatched,
+                                    f"Mismatched Rows ({len(mismatched) // 2})", current_row)
     if len(missing_df) > 0:
-        current_row = write_section(ws, missing_df, f"Missing from File / SQL Only ({len(missing_df)})", current_row)
+        current_row = write_section(ws, missing_df,
+                                    f"Missing from File / SQL Only ({len(missing_df)})", current_row)
     if len(extra_df) > 0:
-        current_row = write_section(ws, extra_df, f"Extra in File / Not in SQL ({len(extra_df)})", current_row)
+        current_row = write_section(ws, extra_df,
+                                    f"Extra in File / Not in SQL ({len(extra_df)})", current_row)
 
     if len(df) == 0:
         ws.cell(row=1, column=1, value="No discrepancies found - data matches perfectly!")
@@ -435,7 +490,6 @@ def export_excel():
                 max_len = val_len
         ws.column_dimensions[col_letter].width = min(max_len + 3, 40)
 
-    # Save to memory and return
     output = BytesIO()
     wb.save(output)
     output.seek(0)
@@ -446,3 +500,36 @@ def export_excel():
         as_attachment=True,
         download_name=f'reconciliation_{result_id[:8]}.xlsx'
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Serve React UI (catch-all route — must be LAST)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    """Serve React frontend. API routes are handled above."""
+    full_path = os.path.join(FRONTEND_DIST, path)
+    if path and os.path.isfile(full_path):
+        return send_from_directory(FRONTEND_DIST, path)
+    index_path = os.path.join(FRONTEND_DIST, 'index.html')
+    if os.path.isfile(index_path):
+        return send_from_directory(FRONTEND_DIST, 'index.html')
+    return safe_jsonify({
+        "error": "Frontend not built. Run 'npm run build' in the frontend/ folder first."
+    }, 404)
+
+
+# ── Graceful shutdown: clean up temp cache ──
+def _on_shutdown():
+    try:
+        clear_cache()
+    except Exception:
+        pass
+
+atexit.register(_on_shutdown)
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)

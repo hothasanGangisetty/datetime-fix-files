@@ -1,5 +1,5 @@
 """
-Module 1: Smart Fingerprint Comparison Engine
+Smart Fingerprint Comparison Engine
 Key-based + hash-based order-independent comparison for SQL-to-File reconciliation.
 
 Handles all SQL temporal types:
@@ -10,18 +10,21 @@ Handles all SQL temporal types:
 import pandas as pd
 import numpy as np
 import re
+
 # CRITICAL: "import time" would clash with datetime.time references.
 # Rename to time_module so time_module.time() works for perf timing.
 import time as time_module
+
 from collections import Counter
 
 # CRITICAL: import datetime as MODULE alias so we can use
 # dt_module.datetime, dt_module.date, dt_module.time, dt_module.timedelta
-# DO NOT use "from datetime import datetime" — it shadows the module!
+# DO NOT use "from datetime import date, datetime" — it shadows the module
+# and causes: "type object 'datetime.datetime' has no attribute 'time'"
 import datetime as dt_module
 
-from common.json_utils import (sanitize_df_for_json, _is_datetimetz,
-                                normalize_timestamp)
+from utils.json_utils import (sanitize_df_for_json, _is_datetimetz,
+                               normalize_timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +206,12 @@ def _clean_display_value(val):
 
 # ========================= Pre / Post Transform ===========================
 
-def transform_to_pre_post(diff_df, key_cols, common_cols, sql_label='SQL', file_label='File'):
-    """Transform side-by-side _sql/_file columns into stacked source rows.
+def transform_to_pre_post(diff_df, key_cols, common_cols):
+    """Transform side-by-side _sql/_file columns into stacked pre/post rows.
 
-    For Mismatches:     2 rows (source=sql_label values, source=file_label values)
-    For Only in SQL:    1 row  (source=sql_label)
-    For Only in File:   1 row  (source=file_label)
-
-    sql_label / file_label control the value in the 'source' column,
-    e.g. 'SQL' and 'test@diff.xlsx'.
+    For Mismatches:     2 rows (pre = SQL values, post = File values)
+    For Only in SQL:    1 row  (pre)
+    For Only in File:   1 row  (post)
     """
     rows = []
 
@@ -231,31 +231,31 @@ def transform_to_pre_post(diff_df, key_cols, common_cols, sql_label='SQL', file_
 
         mismatch_str = ','.join(mismatch_cols)
 
-        # SQL row
+        # PRE row (SQL values)
         if status in ('Mismatch', 'Only in SQL'):
             pre = {k: row.get(k, '') for k in key_cols}
             for col in common_cols:
                 pre[col] = _clean_display_value(row.get(f'{col}_sql', row.get(col, '')))
-            pre['source'] = sql_label
+            pre['pre/post'] = 'pre'
             pre['status'] = status
             pre['_mismatch_cols'] = mismatch_str
             rows.append(pre)
 
-        # File row
+        # POST row (File values)
         if status in ('Mismatch', 'Only in File'):
             post = {k: row.get(k, '') for k in key_cols}
             for col in common_cols:
                 post[col] = _clean_display_value(row.get(f'{col}_file', row.get(col, '')))
-            post['source'] = file_label
+            post['pre/post'] = 'post'
             post['status'] = status
             post['_mismatch_cols'] = mismatch_str
             rows.append(post)
 
     if not rows:
-        return pd.DataFrame(columns=key_cols + common_cols + ['source', 'status', '_mismatch_cols'])
+        return pd.DataFrame(columns=key_cols + common_cols + ['pre/post', 'status', '_mismatch_cols'])
 
     result = pd.DataFrame(rows)
-    ordered = [c for c in key_cols + common_cols + ['source', 'status', '_mismatch_cols'] if c in result.columns]
+    ordered = [c for c in key_cols + common_cols + ['pre/post', 'status', '_mismatch_cols'] if c in result.columns]
     return result[ordered]
 
 
@@ -267,11 +267,7 @@ def _compute_normalized_frame(df, cols):
     Handles datetime and tz-aware columns."""
     nf = pd.DataFrame(index=df.index)
     for col in cols:
-        # Detect datetime/tz-aware columns for special handling
-        if pd.api.types.is_datetime64_any_dtype(df[col]) or _is_datetimetz(df[col]):
-            nf[col] = _fast_normalize_series(df[col])
-        else:
-            nf[col] = _fast_normalize_series(df[col])
+        nf[col] = _fast_normalize_series(df[col])
     return nf
 
 
@@ -288,7 +284,7 @@ def _smart_no_key_comparison(df_sql, df_file, common_cols):
         Unpaired SQL  ->  Only in SQL.
         Unpaired File ->  Only in File.
 
-    Returns (diff_df, matched_count).
+    Returns (diff_df, matched_count, pairing_skipped).
     diff_df columns: {col}_sql, {col}_file, status, has_mismatch, Match#
     """
     t0 = time_module.time()
@@ -335,7 +331,7 @@ def _smart_no_key_comparison(df_sql, df_file, common_cols):
           f"unmatched in {time_module.time()-t1:.2f}s")
 
     # ---- Step 3: similarity-based pairing ----
-    paired = []
+    paired = []                     # list of (sql_idx, file_idx)
     pairing_skipped = False
 
     if (len(sql_unmatched_idxs) > 0 and len(file_unmatched_idxs) > 0):
@@ -343,14 +339,14 @@ def _smart_no_key_comparison(df_sql, df_file, common_cols):
                 and len(file_unmatched_idxs) <= MAX_PAIR_SIZE):
             t2 = time_module.time()
 
-            sql_vals  = sql_norm.loc[sql_unmatched_idxs].values
-            file_vals = file_norm.loc[file_unmatched_idxs].values
+            sql_vals  = sql_norm.loc[sql_unmatched_idxs].values    # shape (u_sql , n_cols)
+            file_vals = file_norm.loc[file_unmatched_idxs].values  # shape (u_file, n_cols)
 
             # Vectorised similarity matrix: sim[i][j] = matching-column count
             similarity = np.zeros((len(sql_vals), len(file_vals)), dtype=np.int32)
             for c in range(n_cols):
-                sql_col  = sql_vals[:, c].reshape(-1, 1)
-                file_col = file_vals[:, c].reshape(1, -1)
+                sql_col  = sql_vals[:, c].reshape(-1, 1)     # (u_sql, 1)
+                file_col = file_vals[:, c].reshape(1, -1)    # (1, u_file)
                 similarity += (sql_col == file_col).astype(np.int32)
 
             # Minimum threshold: at least 30 % of columns must match (min 1)
@@ -481,14 +477,12 @@ def _key_based_comparison(df_sql, df_file, keys):
 
 # ========================== Public Entry Point ==============================
 
-def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
+def run_hybrid_comparison(df_sql, df_file, keys=None):
     """Compare two DataFrames and return (pre_post_df, summary).
 
     When *keys* are provided  -> key-based outer join  (100 % accurate).
     When *keys* are empty     -> smart fingerprint + similarity pairing
                                  (accurate regardless of row order).
-
-    file_name is used as the label for the file source column (instead of 'post').
 
     Automatically normalizes all datetime/timezone columns at entry so that
     SQL temporal types (TIME, DATETIME2, DATETIMEOFFSET, etc.) compare correctly
@@ -546,8 +540,7 @@ def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
             "elapsed_seconds":    round(time_module.time() - t_start, 2)
         }
 
-        pre_post_df = transform_to_pre_post(
-            final, key_cols, common_cols, sql_label='SQL', file_label=file_name)
+        pre_post_df = transform_to_pre_post(final, key_cols, common_cols)
 
         # Post-comparison: ensure all datetime columns are sanitized
         for col in pre_post_df.columns:
@@ -586,6 +579,5 @@ def run_hybrid_comparison(df_sql, df_file, keys=None, file_name='File'):
             "elapsed_seconds":    round(time_module.time() - t_start, 2)
         }
 
-        pre_post_df = transform_to_pre_post(
-            diff_df, key_cols, common_cols, sql_label='SQL', file_label=file_name)
+        pre_post_df = transform_to_pre_post(diff_df, key_cols, common_cols)
         return pre_post_df, summary
